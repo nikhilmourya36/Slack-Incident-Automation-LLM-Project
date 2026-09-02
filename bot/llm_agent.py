@@ -1,30 +1,58 @@
 """
-LLM Agent (provider-agnostic, simple classification)
-======================================================
-Sends a Slack message to the configured LLM provider (Gemini, Claude, or
-Grok) and asks one yes/no question: is this message reporting that a
-site/service is down? Switch providers via LLM_PROVIDER in config/settings.py.
+LLM Agent (provider-agnostic, structured classification + reply)
+====================================================================
+Sends a Slack message to the configured LLM provider (Gemini, Claude,
+Grok, or Groq) and gets back THREE things in one call:
+  - category: SITE_DOWN | PRODUCT_MISSING | NONE
+  - product_query: extracted product name/item number (PRODUCT_MISSING only)
+  - reply: a natural-language Slack reply the LLM writes itself --
+           "on it, checking now" style if a tool applies, or an honest
+           "I don't have a tool for that yet" if not.
+
+Switch providers via LLM_PROVIDER in config/settings.py.
 """
 from __future__ import annotations
 
 import logging
+import re
 
 from config.settings import LLM_PROVIDER
 
 logger = logging.getLogger(__name__)
 
 _CLASSIFY_PROMPT = """\
-You are an SRE assistant. A teammate posted this message in a DevOps Slack channel:
+You are an SRE assistant bot in a DevOps Slack channel. A teammate posted:
 
 "{message}"
 
-Is this message reporting that a website or service is down, broken, or having
-an outage? Answer with exactly one word: YES or NO. Do not explain.
+Step 1 -- Classify this message into exactly ONE category:
+- SITE_DOWN: the message says a website or service is down, broken, or having an outage.
+- PRODUCT_MISSING: the message says a specific product or item isn't showing up,
+  isn't visible, or can't be found on the site (but the site itself seems fine).
+- NONE: neither of the above -- a generic message, question, or chat you have no tool for.
+
+Step 2 -- If PRODUCT_MISSING, extract the product name or item/SKU number as written.
+
+Step 3 -- Write a short, natural Slack reply (1-2 sentences, friendly, use Slack
+mrkdwn like *bold* sparingly):
+- If SITE_DOWN or PRODUCT_MISSING: acknowledge the report and say you're checking
+  it now (you DO have a tool for this).
+- If NONE: politely say you don't have a tool to help with that kind of request
+  right now. Be honest and brief, in your own words.
+
+Respond in EXACTLY this format, nothing else before or after it:
+CATEGORY: <SITE_DOWN|PRODUCT_MISSING|NONE>
+PRODUCT: <extracted product name or item number, or NONE if not applicable>
+REPLY: <your Slack reply text, one or two sentences>
 """
+
+_CATEGORY_RE = re.compile(r"CATEGORY:\s*(SITE_DOWN|PRODUCT_MISSING|NONE)", re.IGNORECASE)
+_PRODUCT_RE = re.compile(r"PRODUCT:\s*(.+?)(?:\n|$)", re.IGNORECASE)
+_REPLY_RE = re.compile(r"REPLY:\s*(.+)", re.IGNORECASE | re.DOTALL)
 
 
 class LLMAgent:
-    """Classifies whether a Slack message reports an outage."""
+    """Classifies Slack messages and writes a reply, in one call."""
 
     def __init__(self) -> None:
         self._provider = (LLM_PROVIDER or "gemini").strip().lower()
@@ -34,8 +62,17 @@ class LLMAgent:
                 "Use 'gemini', 'claude', 'grok', or 'groq'."
             )
 
-    def is_site_down_report(self, message: str) -> bool:
-        """Ask the LLM whether *message* is reporting an outage."""
+    def classify_message(self, message: str) -> dict:
+        """
+        Classify *message* and get a reply for it.
+
+        Returns:
+            {
+                "category": "site_down" | "product_missing" | "none",
+                "product_query": str | None,  # only set for product_missing
+                "reply": str,                  # always set -- what to post in Slack
+            }
+        """
         prompt = _CLASSIFY_PROMPT.format(message=message)
         try:
             if self._provider == "gemini":
@@ -48,13 +85,39 @@ class LLMAgent:
                 answer = self._ask_groq(prompt)
         except Exception as exc:  # noqa: BLE001
             logger.error("%s classification failed: %s", self._provider, exc)
-            return False
+            return {
+                "category": "none",
+                "product_query": None,
+                "reply": "Sorry, I hit an error trying to process that -- please try again.",
+            }
 
         logger.info("LLM classification for %r -> %r", message[:80], answer.strip())
-        return answer.strip().upper().startswith("YES")
+        return self._parse_response(answer)
+
+    @staticmethod
+    def _parse_response(answer: str) -> dict:
+        category_match = _CATEGORY_RE.search(answer)
+        product_match = _PRODUCT_RE.search(answer)
+        reply_match = _REPLY_RE.search(answer)
+
+        category = category_match.group(1).upper() if category_match else "NONE"
+
+        product_query = product_match.group(1).strip() if product_match else None
+        if product_query and product_query.upper() == "NONE":
+            product_query = None
+
+        reply = reply_match.group(1).strip() if reply_match else (
+            "Got your message, but I'm not able to help with that right now."
+        )
+
+        return {
+            "category": category.lower(),
+            "product_query": product_query if category == "PRODUCT_MISSING" else None,
+            "reply": reply,
+        }
 
     # ------------------------------------------------------------------
-    # Provider calls — each is a single plain-text completion, no tools.
+    # Provider calls -- each is a single plain-text completion, no tools.
     # ------------------------------------------------------------------
 
     def _ask_gemini(self, prompt: str) -> str:
@@ -74,7 +137,7 @@ class LLMAgent:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         response = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=10,
+            max_tokens=150,
             messages=[{"role": "user", "content": prompt}],
         )
         return "".join(block.text for block in response.content if block.type == "text")
@@ -92,9 +155,7 @@ class LLMAgent:
         return response.choices[0].message.content or ""
 
     def _ask_groq(self, prompt: str) -> str:
-        """Requires: pip install openai (Groq is OpenAI-compatible).
-        Groq (groq.com) is a fast-inference host for open models like
-        Qwen/Llama — not the same company as Grok/xAI above."""
+        """Requires: pip install openai (Groq is OpenAI-compatible)"""
         from openai import OpenAI
         from config.settings import GROQ_API_KEY, GROQ_MODEL
 
