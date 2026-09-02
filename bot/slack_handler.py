@@ -173,7 +173,7 @@ def handle_message(event: dict, logger: logging.Logger) -> None:  # type: ignore
         return
 
     bot_id = _get_bot_user_id()
-    if bot_id and f"<@{bot_id}>" in text:
+    if bot_id and re.search(rf"<@{re.escape(bot_id)}(\||>)", text):
         return  # let app_mention handle it
 
     # 1. Classify + immediate acknowledgment
@@ -196,6 +196,8 @@ def handle_message(event: dict, logger: logging.Logger) -> None:  # type: ignore
 
 @app.event("app_mention")
 def handle_mention(event: dict, logger: logging.Logger) -> None:  # type: ignore[override]
+    logger.info("DEBUG app_mention event received: %r", event.get("text", ""))
+
     channel_id: str = event.get("channel", "")
     ts: str = event.get("ts", "")
     thread_ts: str = event.get("thread_ts") or ts
