@@ -52,19 +52,24 @@ SANITY_CHECK_TIMEOUT = _get_float("SANITY_CHECK_TIMEOUT", default=10.0)
 LATENCY_THRESHOLD = _get_float("LATENCY_THRESHOLD", default=3.0)
 
 # ---------------------------------------------------------------------------
-# PagerDuty
+# PagerDuty (REST API -- creates incidents directly, returns a real URL
+# immediately, no async lookup needed)
 # ---------------------------------------------------------------------------
 
-# Events API v2 routing key -- from the PagerDuty service's Integrations tab
-# (Add integration -> Events API v2). This is what actually triggers a page.
-PAGERDUTY_ROUTING_KEY = _get("PAGERDUTY_ROUTING_KEY")
-
-# Optional: a separate REST API token (Settings -> API Access in PagerDuty).
-# Only needed to fetch a clickable incident URL to post in Slack -- paging
-# itself works fine without this.
+# REST API token: PagerDuty -> Settings -> API Access -> Create New API Key
 PAGERDUTY_API_KEY = _get("PAGERDUTY_API_KEY")
 
-# Just a label used in the incident title/component -- not an auth credential.
+# The target service's ID (from the service's URL in PagerDuty, e.g. "PWIXJZS")
+PAGERDUTY_SERVICE_ID = _get("PAGERDUTY_SERVICE_ID")
+
+# Optional -- if blank, the service's default escalation policy is used
+PAGERDUTY_ESCALATION_POLICY_ID = _get("PAGERDUTY_ESCALATION_POLICY_ID")
+
+# Required if PAGERDUTY_API_KEY is an account-level token (not a user-level
+# one) -- must be the email of a real user on the PagerDuty account.
+PAGERDUTY_FROM_EMAIL = _get("PAGERDUTY_FROM_EMAIL")
+
+# Just a label used in the incident title -- not an auth credential.
 PAGERDUTY_SERVICE_NAME = _get("PAGERDUTY_SERVICE_NAME", default="Web-Frontend-Team")
 
 # Slack user group to @-mention when paging (the group's ID, e.g. "S0123ABC" --
