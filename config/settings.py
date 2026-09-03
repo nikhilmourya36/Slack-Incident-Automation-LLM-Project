@@ -52,6 +52,27 @@ SANITY_CHECK_TIMEOUT = _get_float("SANITY_CHECK_TIMEOUT", default=10.0)
 LATENCY_THRESHOLD = _get_float("LATENCY_THRESHOLD", default=3.0)
 
 # ---------------------------------------------------------------------------
+# PagerDuty
+# ---------------------------------------------------------------------------
+
+# Events API v2 routing key -- from the PagerDuty service's Integrations tab
+# (Add integration -> Events API v2). This is what actually triggers a page.
+PAGERDUTY_ROUTING_KEY = _get("PAGERDUTY_ROUTING_KEY")
+
+# Optional: a separate REST API token (Settings -> API Access in PagerDuty).
+# Only needed to fetch a clickable incident URL to post in Slack -- paging
+# itself works fine without this.
+PAGERDUTY_API_KEY = _get("PAGERDUTY_API_KEY")
+
+# Just a label used in the incident title/component -- not an auth credential.
+PAGERDUTY_SERVICE_NAME = _get("PAGERDUTY_SERVICE_NAME", default="Web-Frontend-Team")
+
+# Slack user group to @-mention when paging (the group's ID, e.g. "S0123ABC" --
+# find it via the group's "Copy link" in Slack, or the usergroups.list API;
+# NOT the same as the group's @handle).
+SLACK_WEB_ONCALL_GROUP_ID = _get("SLACK_WEB_ONCALL_GROUP_ID")
+
+# ---------------------------------------------------------------------------
 # LLM provider — pick one: "gemini" | "claude" | "grok"
 # ---------------------------------------------------------------------------
 
