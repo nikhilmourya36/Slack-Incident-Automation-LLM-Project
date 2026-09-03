@@ -33,8 +33,13 @@ from config.settings import (
     SLACK_SIGNING_SECRET,
     SANITY_CHECK_TIMEOUT,
     LATENCY_THRESHOLD,
+    PAGERDUTY_ROUTING_KEY,
+    PAGERDUTY_API_KEY,
+    PAGERDUTY_SERVICE_NAME,
+    SLACK_WEB_ONCALL_GROUP_ID,
 )
 from bot.llm_agent import LLMAgent
+from bot.pagerduty_client import trigger_incident, get_incident_url
 from tools.sanity_checker import run_sanity_check
 from tools.product_search import search_product
 
@@ -101,7 +106,9 @@ def _reply(channel_id: str, thread_ts: str, text: str) -> None:
 
 
 def _handle_site_down(channel_id: str, ts: str, original_message: str) -> None:
-    """Run a real sanity check and always reply with the LLM's explanation of it."""
+    """Run a real sanity check and always reply with the LLM's explanation of it.
+    If genuinely down/degraded, also page the on-call via PagerDuty and
+    @-mention the on-call Slack group in the thread."""
     for url in MONITORED_URLS:
         report = run_sanity_check(
             url, timeout=SANITY_CHECK_TIMEOUT, latency_threshold=LATENCY_THRESHOLD
@@ -118,7 +125,62 @@ def _handle_site_down(channel_id: str, ts: str, original_message: str) -> None:
             checks_summary=checks_summary,
         )
         _reply(channel_id, ts, reply)
+
+        if status in ("YELLOW", "RED"):
+            _page_on_call(channel_id, ts, url, status, original_message)
+
         break  # one checked URL is enough for this demo
+
+
+def _page_on_call(channel_id: str, ts: str, url: str, status: str, original_message: str) -> None:
+    """Trigger PagerDuty, @-mention the on-call group, and post the incident link."""
+    if not PAGERDUTY_ROUTING_KEY:
+        logger.warning("Site is down but PAGERDUTY_ROUTING_KEY isn't set -- skipping page.")
+        _reply(
+            channel_id, ts,
+            ":warning: This looks like a real outage, but PagerDuty isn't configured "
+            "yet -- please page on-call manually.",
+        )
+        return
+
+    title = f"{PAGERDUTY_SERVICE_NAME}: Website Down — {url}"
+    pd_result = trigger_incident(
+        routing_key=PAGERDUTY_ROUTING_KEY,
+        title=title,
+        description=original_message,
+        severity="critical",
+        url=url,
+        component=PAGERDUTY_SERVICE_NAME,
+    )
+
+    oncall_mention = (
+        f"<!subteam^{SLACK_WEB_ONCALL_GROUP_ID}>" if SLACK_WEB_ONCALL_GROUP_ID else "on-call"
+    )
+
+    if not pd_result.get("success"):
+        _reply(
+            channel_id, ts,
+            f":warning: {oncall_mention} — tried to page automatically but it failed "
+            f"({pd_result.get('message', 'unknown error')}). Please page manually.",
+        )
+        return
+
+    dedup_key = pd_result.get("dedup_key", "")
+    incident_url = get_incident_url(PAGERDUTY_API_KEY, dedup_key) if PAGERDUTY_API_KEY else None
+
+    if incident_url:
+        link_line = f"PagerDuty incident: {incident_url}"
+    else:
+        link_line = (
+            f"PagerDuty alert key: `{dedup_key}` "
+            "(set PAGERDUTY_API_KEY to also get a direct incident link here)"
+        )
+
+    _reply(
+        channel_id, ts,
+        f":pager: {oncall_mention} — paged for *{PAGERDUTY_SERVICE_NAME}*, please take a look.\n"
+        f"{link_line}",
+    )
 
 
 def _handle_product_missing(channel_id: str, ts: str, original_message: str, product_query: str | None) -> None:
