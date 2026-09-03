@@ -33,13 +33,15 @@ from config.settings import (
     SLACK_SIGNING_SECRET,
     SANITY_CHECK_TIMEOUT,
     LATENCY_THRESHOLD,
-    PAGERDUTY_ROUTING_KEY,
     PAGERDUTY_API_KEY,
+    PAGERDUTY_SERVICE_ID,
+    PAGERDUTY_ESCALATION_POLICY_ID,
+    PAGERDUTY_FROM_EMAIL,
     PAGERDUTY_SERVICE_NAME,
     SLACK_WEB_ONCALL_GROUP_ID,
 )
 from bot.llm_agent import LLMAgent
-from bot.pagerduty_client import trigger_incident, get_incident_url
+from bot.pagerduty_client import trigger_incident
 from tools.sanity_checker import run_sanity_check
 from tools.product_search import search_product
 
@@ -133,9 +135,12 @@ def _handle_site_down(channel_id: str, ts: str, original_message: str) -> None:
 
 
 def _page_on_call(channel_id: str, ts: str, url: str, status: str, original_message: str) -> None:
-    """Trigger PagerDuty, @-mention the on-call group, and post the incident link."""
-    if not PAGERDUTY_ROUTING_KEY:
-        logger.warning("Site is down but PAGERDUTY_ROUTING_KEY isn't set -- skipping page.")
+    """Create a PagerDuty incident via REST API, @-mention the on-call group,
+    and post the incident link -- returned directly, no separate lookup needed."""
+    if not (PAGERDUTY_API_KEY and PAGERDUTY_SERVICE_ID):
+        logger.warning(
+            "Site is down but PAGERDUTY_API_KEY/PAGERDUTY_SERVICE_ID isn't set -- skipping page."
+        )
         _reply(
             channel_id, ts,
             ":warning: This looks like a real outage, but PagerDuty isn't configured "
@@ -145,12 +150,13 @@ def _page_on_call(channel_id: str, ts: str, url: str, status: str, original_mess
 
     title = f"{PAGERDUTY_SERVICE_NAME}: Website Down — {url}"
     pd_result = trigger_incident(
-        routing_key=PAGERDUTY_ROUTING_KEY,
+        api_key=PAGERDUTY_API_KEY,
+        service_id=PAGERDUTY_SERVICE_ID,
         title=title,
-        description=original_message,
-        severity="critical",
-        url=url,
-        component=PAGERDUTY_SERVICE_NAME,
+        description=f"Reported in Slack: {original_message}\nStatus: {status}\nURL: {url}",
+        urgency="high",
+        escalation_policy_id=PAGERDUTY_ESCALATION_POLICY_ID or None,
+        from_email=PAGERDUTY_FROM_EMAIL or None,
     )
 
     oncall_mention = (
@@ -165,16 +171,13 @@ def _page_on_call(channel_id: str, ts: str, url: str, status: str, original_mess
         )
         return
 
-    dedup_key = pd_result.get("dedup_key", "")
-    incident_url = get_incident_url(PAGERDUTY_API_KEY, dedup_key) if PAGERDUTY_API_KEY else None
+    incident_url = pd_result.get("incident_url")
+    incident_number = pd_result.get("incident_number")
 
     if incident_url:
-        link_line = f"PagerDuty incident: {incident_url}"
+        link_line = f"PagerDuty incident #{incident_number}: {incident_url}"
     else:
-        link_line = (
-            f"PagerDuty alert key: `{dedup_key}` "
-            "(set PAGERDUTY_API_KEY to also get a direct incident link here)"
-        )
+        link_line = f"Incident key: `{pd_result.get('incident_key')}` (no URL returned)"
 
     _reply(
         channel_id, ts,

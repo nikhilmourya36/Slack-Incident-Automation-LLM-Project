@@ -29,65 +29,104 @@ def _build_dedup_key(title: str) -> str:
 
 
 def trigger_incident(
-    routing_key: str,
+    api_key: str,
+    service_id: str,
     title: str,
     description: str,
-    severity: str = "critical",
-    url: str | None = None,
-    component: str = "Website",
-    source: str = "SlackIncidentBot",
-    dedup_key: str | None = None,
+    urgency: str = "high",
+    escalation_policy_id: str | None = None,
+    from_email: str | None = None,
+    incident_key: str | None = None,
+    timeout: float = REQUEST_TIMEOUT,
 ) -> dict:
     """
-    Trigger a PagerDuty incident via Events API v2.
+    Create a PagerDuty incident directly via the REST API (POST /incidents).
+
+    Unlike Events API v2, this creates the incident synchronously and
+    returns its real URL in the same response -- no separate lookup needed,
+    and no risk of the event getting silently dropped by orchestration
+    rules further down an async pipeline.
+
+    Args:
+        api_key: PagerDuty REST API token (Settings -> API Access).
+        service_id: The target service's ID, e.g. "PWIXJZS".
+        title: Incident title/summary.
+        description: Longer description, goes in the incident body.
+        urgency: "high" or "low".
+        escalation_policy_id: Optional -- if omitted, the service's default
+            escalation policy is used.
+        from_email: Required if api_key is an account-level API token (not
+            a user-level one) -- must be the email of a real user on the
+            account. PagerDuty uses this to attribute the incident.
+        incident_key: Optional custom dedup key; auto-generated if omitted.
 
     Returns:
-        dict with keys: success (bool), dedup_key (str), message (str)
+        dict with keys: success (bool), incident_key (str),
+        incident_url (str | None), incident_number (int | None), message (str)
     """
-    dedup_key = dedup_key or _build_dedup_key(title)
+    incident_key = incident_key or _build_dedup_key(title)
 
-    payload: dict = {
-        "routing_key": routing_key,
-        "event_action": "trigger",
-        "dedup_key": dedup_key,
-        "payload": {
-            "summary": title,
-            "severity": severity,
-            "source": source,
-            "component": component,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "custom_details": {
-                "description": description,
-                "affected_url": url or "N/A",
-                "reported_via": "Slack",
-                "automation": "IncidentBot",
-            },
-        },
+    incident_body: dict = {
+        "type": "incident",
+        "title": title,
+        "service": {"id": service_id, "type": "service_reference"},
+        "urgency": urgency,
+        "incident_key": incident_key,
+        "body": {"type": "incident_body", "details": description},
     }
-    if url:
-        payload["links"] = [{"href": url, "text": "Affected Service"}]
+    if escalation_policy_id:
+        incident_body["escalation_policy"] = {
+            "id": escalation_policy_id,
+            "type": "escalation_policy_reference",
+        }
+
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Token token={api_key}",
+        "Content-Type": "application/json",
+    }
+    if from_email:
+        headers["From"] = from_email
 
     try:
         resp = requests.post(
-            PD_EVENTS_URL,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=REQUEST_TIMEOUT,
+            PD_REST_INCIDENTS_URL,
+            json={"incident": incident_body},
+            headers=headers,
+            timeout=timeout,
         )
         resp.raise_for_status()
-        data = resp.json()
-        logger.info("PagerDuty incident triggered. dedup_key=%s", dedup_key)
+        incident = resp.json().get("incident", {})
+        logger.info(
+            "PagerDuty incident created via REST API: #%s (%s)",
+            incident.get("incident_number"), incident.get("html_url"),
+        )
         return {
             "success": True,
-            "dedup_key": data.get("dedup_key", dedup_key),
-            "message": data.get("message", "Event created"),
+            "incident_key": incident_key,
+            "incident_url": incident.get("html_url"),
+            "incident_number": incident.get("incident_number"),
+            "message": "Incident created",
         }
     except requests.exceptions.HTTPError as exc:
-        logger.error("PagerDuty HTTP error: %s — %s", exc, exc.response.text if exc.response else "")
-        return {"success": False, "dedup_key": dedup_key, "message": str(exc)}
+        body_text = exc.response.text if exc.response else ""
+        logger.error("PagerDuty REST API error: %s — %s", exc, body_text)
+        return {
+            "success": False,
+            "incident_key": incident_key,
+            "incident_url": None,
+            "incident_number": None,
+            "message": f"{exc} — {body_text}",
+        }
     except requests.exceptions.RequestException as exc:
         logger.error("PagerDuty request failed: %s", exc)
-        return {"success": False, "dedup_key": dedup_key, "message": str(exc)}
+        return {
+            "success": False,
+            "incident_key": incident_key,
+            "incident_url": None,
+            "incident_number": None,
+            "message": str(exc),
+        }
 
 
 def resolve_incident(routing_key: str, dedup_key: str) -> dict:
@@ -110,54 +149,3 @@ def resolve_incident(routing_key: str, dedup_key: str) -> dict:
     except requests.exceptions.RequestException as exc:
         logger.error("Failed to resolve PagerDuty incident: %s", exc)
         return {"success": False, "message": str(exc)}
-
-
-def get_incident_url(
-    api_key: str,
-    dedup_key: str,
-    retries: int = 3,
-    retry_delay: float = 2.0,
-    timeout: float = REQUEST_TIMEOUT,
-) -> str | None:
-    """
-    Look up the web URL of the incident created from *dedup_key*, via
-    PagerDuty's REST API. Requires a REST API token (Settings -> API
-    Access in PagerDuty) -- NOT the same credential as the Events API v2
-    routing key used by trigger_incident().
-
-    PagerDuty can take a moment to make a freshly-triggered incident
-    queryable via REST, so this retries briefly before giving up.
-
-    Returns the incident's html_url, or None if not found / no api_key set.
-    """
-    if not api_key:
-        return None
-
-    headers = {
-        "Authorization": f"Token token={api_key}",
-        "Accept": "application/vnd.pagerduty+json;version=2",
-    }
-
-    for attempt in range(retries):
-        try:
-            resp = requests.get(
-                PD_REST_INCIDENTS_URL,
-                params={"incident_key": dedup_key},
-                headers=headers,
-                timeout=timeout,
-            )
-            resp.raise_for_status()
-            incidents = resp.json().get("incidents", [])
-            if incidents:
-                return incidents[0].get("html_url")
-        except requests.exceptions.RequestException as exc:
-            logger.warning(
-                "PagerDuty incident lookup attempt %d/%d failed: %s",
-                attempt + 1, retries, exc,
-            )
-
-        if attempt < retries - 1:
-            time.sleep(retry_delay)
-
-    logger.warning("Could not resolve a PagerDuty incident URL for dedup_key=%s", dedup_key)
-    return None
