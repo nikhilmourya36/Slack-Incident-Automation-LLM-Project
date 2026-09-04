@@ -110,7 +110,29 @@ def trigger_incident(
         }
     except requests.exceptions.HTTPError as exc:
         body_text = exc.response.text if exc.response else ""
+        status_code = exc.response.status_code if exc.response else None
         logger.error("PagerDuty REST API error: %s — %s", exc, body_text)
+
+        # PagerDuty rejects POST /incidents with 400 if incident_key already
+        # has an OPEN incident on this service (unlike Events API v2, which
+        # merges automatically). That's expected here -- it means someone
+        # already reported this same outage today. Look up and reuse the
+        # existing incident instead of treating this as a failure.
+        if status_code == 400 and "incident key" in body_text.lower():
+            logger.info(
+                "incident_key %s already has an open incident -- reusing it instead of failing.",
+                incident_key,
+            )
+            existing = _lookup_incident_by_key(api_key, incident_key, timeout)
+            if existing:
+                return {
+                    "success": True,
+                    "incident_key": incident_key,
+                    "incident_url": existing.get("html_url"),
+                    "incident_number": existing.get("incident_number"),
+                    "message": "Reused existing open incident (already reported today)",
+                }
+
         return {
             "success": False,
             "incident_key": incident_key,
@@ -127,6 +149,26 @@ def trigger_incident(
             "incident_number": None,
             "message": str(exc),
         }
+
+
+def _lookup_incident_by_key(api_key: str, incident_key: str, timeout: float) -> dict | None:
+    """Find an existing incident by its incident_key, via REST API."""
+    try:
+        resp = requests.get(
+            PD_REST_INCIDENTS_URL,
+            params={"incident_key": incident_key},
+            headers={
+                "Authorization": f"Token token={api_key}",
+                "Accept": "application/json",
+            },
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        incidents = resp.json().get("incidents", [])
+        return incidents[0] if incidents else None
+    except requests.exceptions.RequestException as exc:
+        logger.error("Failed to look up existing incident for key %s: %s", incident_key, exc)
+        return None
 
 
 def resolve_incident(routing_key: str, dedup_key: str) -> dict:
