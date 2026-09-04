@@ -115,16 +115,18 @@ def trigger_incident(
 
         # PagerDuty rejects POST /incidents with 400 if incident_key already
         # has an OPEN incident on this service (unlike Events API v2, which
-        # merges automatically). That's expected here -- it means someone
-        # already reported this same outage today. Look up and reuse the
-        # existing incident instead of treating this as a failure.
-        if status_code == 400 and "incident key" in body_text.lower():
-            logger.info(
-                "incident_key %s already has an open incident -- reusing it instead of failing.",
-                incident_key,
-            )
+        # merges automatically). The exact error wording -- and even whether
+        # a body is returned at all -- isn't reliable enough to pattern-match
+        # on, so on ANY 400 we just check directly: does an incident with
+        # this key already exist? If so, reuse it. If not, this was some
+        # other genuine validation error, and we report it as a failure below.
+        if status_code == 400:
             existing = _lookup_incident_by_key(api_key, incident_key, timeout)
             if existing:
+                logger.info(
+                    "incident_key %s already has an open incident -- reusing it instead of failing.",
+                    incident_key,
+                )
                 return {
                     "success": True,
                     "incident_key": incident_key,
