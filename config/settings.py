@@ -98,4 +98,4 @@ GROK_MODEL = _get("GROK_MODEL", default="grok-4.6")
 # Groq (groq.com — fast inference host for open models like Qwen/Llama.
 # NOT the same as Grok/xAI above — different company, different API key.)
 GROQ_API_KEY = _get("GROQ_API_KEY")
-GROQ_MODEL = _get("GROQ_MODEL", default="qwen/qwen3.8-27b")
+GROQ_MODEL = _get("GROQ_MODEL", default="openai/gpt-oss-20b")
