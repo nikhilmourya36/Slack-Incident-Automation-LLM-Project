@@ -21,11 +21,25 @@ PD_REST_INCIDENTS_URL = "https://api.pagerduty.com/incidents"
 REQUEST_TIMEOUT = 10  # seconds
 
 
-def _build_dedup_key(title: str) -> str:
-    """Stable dedup key so repeated triggers on the same day merge into one incident."""
+def _build_dedup_key(title: str, window_minutes: int = 24 * 60) -> str:
+    """
+    Stable dedup key so repeated triggers within the same window merge into
+    one incident, instead of paging on-call again for a report of the same
+    ongoing outage. This is intentional -- randomizing the key would defeat
+    the purpose and page on-call once per report instead of once per outage.
+
+    window_minutes controls how fresh a report needs to be to reuse an
+    existing incident vs. start a new one -- default 24h (one incident per
+    title per day). Pass a smaller value (e.g. 60 for hourly) if a
+    recurring outage later the same day should page again rather than
+    silently reuse an old incident.
+    """
     safe_title = title[:50].lower().replace(" ", "-")
-    date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
-    return f"incident-bot-{safe_title}-{date_str}"
+    now = datetime.now(timezone.utc)
+    # Bucket the current time into windows since the epoch, so any two
+    # calls within the same window produce the identical key.
+    bucket = int(now.timestamp() // (window_minutes * 60))
+    return f"incident-bot-{safe_title}-{bucket}"
 
 
 def trigger_incident(
@@ -37,6 +51,7 @@ def trigger_incident(
     escalation_policy_id: str | None = None,
     from_email: str | None = None,
     incident_key: str | None = None,
+    dedup_window_minutes: int = 24 * 60,
     timeout: float = REQUEST_TIMEOUT,
 ) -> dict:
     """
@@ -59,12 +74,15 @@ def trigger_incident(
             a user-level one) -- must be the email of a real user on the
             account. PagerDuty uses this to attribute the incident.
         incident_key: Optional custom dedup key; auto-generated if omitted.
+        dedup_window_minutes: How long repeated reports of the same title
+            reuse one incident before a fresh one is created. Default 24h.
+            Ignored if incident_key is explicitly provided.
 
     Returns:
         dict with keys: success (bool), incident_key (str),
         incident_url (str | None), incident_number (int | None), message (str)
     """
-    incident_key = incident_key or _build_dedup_key(title)
+    incident_key = incident_key or _build_dedup_key(title, dedup_window_minutes)
 
     incident_body: dict = {
         "type": "incident",
