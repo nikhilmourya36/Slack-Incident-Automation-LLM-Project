@@ -1,46 +1,182 @@
 """
 PagerDuty Client
-==================
-Triggers incidents via PagerDuty's Events API v2 (routing key -- no REST
-API token needed for this part), and optionally looks up the resulting
-incident's web URL via PagerDuty's REST API (needs a separate API token,
-since Events API v2 doesn't return a clickable link on its own).
+================
+
+Creates and resolves PagerDuty incidents.
+
+Incident creation uses PagerDuty's REST API:
+    POST https://api.pagerduty.com/incidents
+
+Incident resolution uses PagerDuty's Events API v2:
+    POST https://events.pagerduty.com/v2/enqueue
+
+The REST API returns the incident URL directly.
+
+Duplicate handling:
+    PagerDuty returns HTTP 400 with error code 2002 when an open
+    incident with the same incident_key already exists on the service.
+
+    Example:
+    {
+        "error": {
+            "message": "Arguments Caused Error",
+            "code": 2002,
+            "errors": [
+                "Open incident with matching dedup key already exists on this service"
+            ]
+        }
+    }
+
+    This is treated as an expected duplicate condition rather than
+    a genuine API failure. The existing incident is looked up and
+    reused.
 """
+
 from __future__ import annotations
 
 import logging
-import time
 from datetime import datetime, timezone
 
 import requests
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# PagerDuty endpoints
+# ---------------------------------------------------------------------------
+
 PD_EVENTS_URL = "https://events.pagerduty.com/v2/enqueue"
 PD_REST_INCIDENTS_URL = "https://api.pagerduty.com/incidents"
+
 REQUEST_TIMEOUT = 10  # seconds
 
+# PagerDuty error code returned when an open incident with the same
+# dedup/incident key already exists on the service.
+PD_DUPLICATE_ERROR_CODE = 2002
 
-def _build_dedup_key(title: str, window_minutes: int = 24 * 60) -> str:
-    """
-    Stable dedup key so repeated triggers within the same window merge into
-    one incident, instead of paging on-call again for a report of the same
-    ongoing outage. This is intentional -- randomizing the key would defeat
-    the purpose and page on-call once per report instead of once per outage.
+PD_DUPLICATE_ERROR_TEXT = (
+    "Open incident with matching dedup key already exists on this service"
+)
 
-    window_minutes controls how fresh a report needs to be to reuse an
-    existing incident vs. start a new one -- default 24h (one incident per
-    title per day). Pass a smaller value (e.g. 60 for hourly) if a
-    recurring outage later the same day should page again rather than
-    silently reuse an old incident.
+
+# ---------------------------------------------------------------------------
+# Deduplication
+# ---------------------------------------------------------------------------
+
+def _build_dedup_key(
+    title: str,
+    window_minutes: int = 24 * 60,
+) -> str:
     """
-    safe_title = title[:50].lower().replace(" ", "-")
+    Build a stable deduplication key.
+
+    Repeated reports with the same title within the same time window
+    receive the same key, allowing the application to reuse the same
+    PagerDuty incident.
+
+    Args:
+        title:
+            Incident title.
+
+        window_minutes:
+            Length of the deduplication window.
+
+            Default:
+                24 hours.
+
+            Example:
+                60 -> one incident per title per hour.
+
+    Returns:
+        A deterministic PagerDuty incident key.
+    """
+
+    safe_title = (
+        title[:50]
+        .lower()
+        .replace(" ", "-")
+    )
+
     now = datetime.now(timezone.utc)
-    # Bucket the current time into windows since the epoch, so any two
-    # calls within the same window produce the identical key.
-    bucket = int(now.timestamp() // (window_minutes * 60))
+
+    bucket = int(
+        now.timestamp() // (window_minutes * 60)
+    )
+
     return f"incident-bot-{safe_title}-{bucket}"
 
+
+# ---------------------------------------------------------------------------
+# Duplicate error detection
+# ---------------------------------------------------------------------------
+
+def _is_duplicate_incident_error(
+    response: requests.Response | None,
+) -> bool:
+    """
+    Determine whether a PagerDuty HTTP response represents the
+    expected duplicate-incident condition.
+
+    PagerDuty returns HTTP 400 with a response similar to:
+
+    {
+        "error": {
+            "message": "Arguments Caused Error",
+            "code": 2002,
+            "errors": [
+                "Open incident with matching dedup key already exists on this service"
+            ]
+        }
+    }
+
+    We check both the PagerDuty error code and error message.
+
+    Args:
+        response:
+            PagerDuty HTTP response.
+
+    Returns:
+        True if the response represents a duplicate incident.
+        False otherwise.
+    """
+
+    if response is None:
+        return False
+
+    if response.status_code != 400:
+        return False
+
+    try:
+        error_json = response.json()
+    except ValueError:
+        logger.warning(
+            "PagerDuty returned HTTP 400, but the response was not valid JSON."
+        )
+        return False
+
+    error = error_json.get("error", {})
+
+    error_code = error.get("code")
+    error_messages = error.get("errors", [])
+
+    # Primary check: PagerDuty's documented/observed duplicate error code.
+    if error_code == PD_DUPLICATE_ERROR_CODE:
+        return True
+
+    # Secondary check: protect against the error code changing while
+    # the actual duplicate message remains the same.
+    if any(
+        PD_DUPLICATE_ERROR_TEXT.lower() in str(message).lower()
+        for message in error_messages
+    ):
+        return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Create PagerDuty incident
+# ---------------------------------------------------------------------------
 
 def trigger_incident(
     api_key: str,
@@ -55,121 +191,245 @@ def trigger_incident(
     timeout: float = REQUEST_TIMEOUT,
 ) -> dict:
     """
-    Create a PagerDuty incident directly via the REST API (POST /incidents).
+    Create a PagerDuty incident using the REST API.
 
-    Unlike Events API v2, this creates the incident synchronously and
-    returns its real URL in the same response -- no separate lookup needed,
-    and no risk of the event getting silently dropped by orchestration
-    rules further down an async pipeline.
+    If PagerDuty reports that an open incident with the same
+    incident_key already exists, the existing incident is looked up
+    and reused instead of treating the request as a failure.
 
     Args:
-        api_key: PagerDuty REST API token (Settings -> API Access).
-        service_id: The target service's ID, e.g. "PWIXJZS".
-        title: Incident title/summary.
-        description: Longer description, goes in the incident body.
-        urgency: "high" or "low".
-        escalation_policy_id: Optional -- if omitted, the service's default
-            escalation policy is used.
-        from_email: Required if api_key is an account-level API token (not
-            a user-level one) -- must be the email of a real user on the
-            account. PagerDuty uses this to attribute the incident.
-        incident_key: Optional custom dedup key; auto-generated if omitted.
-        dedup_window_minutes: How long repeated reports of the same title
-            reuse one incident before a fresh one is created. Default 24h.
-            Ignored if incident_key is explicitly provided.
+        api_key:
+            PagerDuty REST API token.
+
+        service_id:
+            PagerDuty service ID.
+
+        title:
+            Incident title.
+
+        description:
+            Detailed incident description.
+
+        urgency:
+            "high" or "low".
+
+        escalation_policy_id:
+            Optional escalation policy ID.
+
+        from_email:
+            Optional PagerDuty user email. Required in some cases when
+            using an account-level API token.
+
+        incident_key:
+            Optional custom incident key.
+
+            If omitted, a stable key is automatically generated.
+
+        dedup_window_minutes:
+            Deduplication window used when automatically generating
+            the incident key.
+
+        timeout:
+            HTTP request timeout.
 
     Returns:
-        dict with keys: success (bool), incident_key (str),
-        incident_url (str | None), incident_number (int | None), message (str)
+        Dictionary containing:
+
+            success
+            incident_key
+            incident_url
+            incident_number
+            likely_duplicate
+            message
     """
-    incident_key = incident_key or _build_dedup_key(title, dedup_window_minutes)
+
+    # -----------------------------------------------------------------------
+    # Generate incident key if one wasn't explicitly supplied.
+    # -----------------------------------------------------------------------
+
+    incident_key = incident_key or _build_dedup_key(
+        title,
+        dedup_window_minutes,
+    )
+
+    # -----------------------------------------------------------------------
+    # Build PagerDuty incident payload.
+    # -----------------------------------------------------------------------
 
     incident_body: dict = {
         "type": "incident",
         "title": title,
-        "service": {"id": service_id, "type": "service_reference"},
+        "service": {
+            "id": service_id,
+            "type": "service_reference",
+        },
         "urgency": urgency,
         "incident_key": incident_key,
-        "body": {"type": "incident_body", "details": description},
+        "body": {
+            "type": "incident_body",
+            "details": description,
+        },
     }
+
+    # Add escalation policy only when supplied.
     if escalation_policy_id:
         incident_body["escalation_policy"] = {
             "id": escalation_policy_id,
             "type": "escalation_policy_reference",
         }
 
+    # -----------------------------------------------------------------------
+    # HTTP headers.
+    # -----------------------------------------------------------------------
+
     headers = {
         "Accept": "application/json",
         "Authorization": f"Token token={api_key}",
         "Content-Type": "application/json",
     }
+
     if from_email:
         headers["From"] = from_email
 
+    # -----------------------------------------------------------------------
+    # Send request.
+    # -----------------------------------------------------------------------
+
     try:
+        logger.info(
+            "Creating PagerDuty incident: incident_key=%s, service_id=%s",
+            incident_key,
+            service_id,
+        )
+
         resp = requests.post(
             PD_REST_INCIDENTS_URL,
             json={"incident": incident_body},
             headers=headers,
             timeout=timeout,
         )
+
+        # Raises HTTPError for 4xx/5xx responses.
         resp.raise_for_status()
+
+        # -------------------------------------------------------------------
+        # Successful incident creation.
+        # -------------------------------------------------------------------
+
         incident = resp.json().get("incident", {})
+
+        incident_url = incident.get("html_url")
+        incident_number = incident.get("incident_number")
+
         logger.info(
-            "PagerDuty incident created via REST API: #%s (%s)",
-            incident.get("incident_number"), incident.get("html_url"),
+            "PagerDuty incident created successfully: #%s (%s)",
+            incident_number,
+            incident_url,
         )
+
         return {
             "success": True,
             "incident_key": incident_key,
-            "incident_url": incident.get("html_url"),
-            "incident_number": incident.get("incident_number"),
+            "incident_url": incident_url,
+            "incident_number": incident_number,
             "likely_duplicate": False,
             "message": "Incident created",
         }
-    except requests.exceptions.HTTPError as exc:
-        body_text = exc.response.text if exc.response else ""
-        status_code = exc.response.status_code if exc.response else None
-        logger.error("PagerDuty REST API error: %s — %s", exc, body_text)
 
-        # PagerDuty rejects POST /incidents with 400 if incident_key already
-        # has an OPEN incident on this service (unlike Events API v2, which
-        # merges automatically). The exact error wording -- and even whether
-        # a body is returned at all -- isn't reliable enough to pattern-match
-        # on, so on ANY 400 we just check directly: does an incident with
-        # this key already exist? If so, reuse it.
-        if status_code == 400:
-            existing = _lookup_incident_by_key(api_key, incident_key, timeout)
+    # -----------------------------------------------------------------------
+    # HTTP errors.
+    # -----------------------------------------------------------------------
+
+    except requests.exceptions.HTTPError as exc:
+
+        response = exc.response
+
+        status_code = (
+            response.status_code
+            if response is not None
+            else None
+        )
+
+        body_text = (
+            response.text
+            if response is not None
+            else ""
+        )
+
+        # ================================================================
+        # DUPLICATE INCIDENT
+        # ================================================================
+
+        if _is_duplicate_incident_error(response):
+
+            logger.info(
+                "PagerDuty incident already exists for incident_key=%s. "
+                "This is an expected duplicate response; looking up "
+                "the existing incident.",
+                incident_key,
+            )
+
+            existing = _lookup_incident_by_key(
+                api_key=api_key,
+                incident_key=incident_key,
+                timeout=timeout,
+            )
+
             if existing:
+
+                existing_url = existing.get("html_url")
+                existing_number = existing.get("incident_number")
+
                 logger.info(
-                    "incident_key %s already has an open incident -- reusing it instead of failing.",
+                    "Reusing existing PagerDuty incident #%s (%s) "
+                    "for incident_key=%s.",
+                    existing_number,
+                    existing_url,
                     incident_key,
                 )
+
                 return {
                     "success": True,
                     "incident_key": incident_key,
-                    "incident_url": existing.get("html_url"),
-                    "incident_number": existing.get("incident_number"),
+                    "incident_url": existing_url,
+                    "incident_number": existing_number,
                     "likely_duplicate": True,
-                    "message": "Reused existing open incident (already reported today)",
+                    "message": "Reused existing open incident",
                 }
-            # Couldn't confirm the existing incident via lookup, but a 400
-            # here is still almost always the duplicate-key case, not a
-            # genuine system failure -- flag it so callers can phrase this
-            # differently from "paging is broken, do it manually".
+
+            # ----------------------------------------------------------------
+            # PagerDuty confirmed duplicate, but lookup did not find it.
+            # ----------------------------------------------------------------
+
             logger.warning(
-                "Got 400 for incident_key=%s but lookup found nothing -- "
-                "treating as likely_duplicate anyway (couldn't confirm which incident).",
+                "PagerDuty confirmed that incident_key=%s already has "
+                "an open incident, but the existing incident could not "
+                "be retrieved.",
                 incident_key,
             )
+
             return {
                 "success": False,
                 "incident_key": incident_key,
                 "incident_url": None,
                 "incident_number": None,
                 "likely_duplicate": True,
-                "message": f"{exc} — {body_text or '(no additional details from PagerDuty)'}",
+                "message": (
+                    "PagerDuty reported an existing open incident, "
+                    "but the existing incident could not be retrieved. "
+                    f"Response: {body_text}"
+                ),
             }
+
+        # ================================================================
+        # OTHER HTTP 400 / 4XX / 5XX ERRORS
+        # ================================================================
+
+        logger.error(
+            "PagerDuty REST API error: HTTP %s — %s",
+            status_code,
+            body_text or str(exc),
+        )
 
         return {
             "success": False,
@@ -177,10 +437,23 @@ def trigger_incident(
             "incident_url": None,
             "incident_number": None,
             "likely_duplicate": False,
-            "message": f"{exc} — {body_text}",
+            "message": (
+                f"{exc} — "
+                f"{body_text or '(no response body)'}"
+            ),
         }
+
+    # -----------------------------------------------------------------------
+    # Network / connection / timeout errors.
+    # -----------------------------------------------------------------------
+
     except requests.exceptions.RequestException as exc:
-        logger.error("PagerDuty request failed: %s", exc)
+
+        logger.error(
+            "PagerDuty request failed: %s",
+            exc,
+        )
+
         return {
             "success": False,
             "incident_key": incident_key,
@@ -191,47 +464,138 @@ def trigger_incident(
         }
 
 
-def _lookup_incident_by_key(api_key: str, incident_key: str, timeout: float) -> dict | None:
-    """Find an existing incident by its incident_key, via REST API."""
+# ---------------------------------------------------------------------------
+# Lookup existing incident
+# ---------------------------------------------------------------------------
+
+def _lookup_incident_by_key(
+    api_key: str,
+    incident_key: str,
+    timeout: float,
+) -> dict | None:
+    """
+    Find an existing PagerDuty incident using its incident key.
+
+    Args:
+        api_key:
+            PagerDuty REST API token.
+
+        incident_key:
+            Incident/deduplication key.
+
+        timeout:
+            HTTP request timeout.
+
+    Returns:
+        Existing incident dictionary, or None if no matching incident
+        could be found.
+    """
+
     try:
+
+        logger.info(
+            "Looking up existing PagerDuty incident: incident_key=%s",
+            incident_key,
+        )
+
         resp = requests.get(
             PD_REST_INCIDENTS_URL,
-            params={"incident_key": incident_key},
+            params={
+                "incident_key": incident_key,
+            },
             headers={
                 "Authorization": f"Token token={api_key}",
                 "Accept": "application/json",
             },
             timeout=timeout,
         )
+
         resp.raise_for_status()
-        incidents = resp.json().get("incidents", [])
-        logger.info(
-            "Lookup for incident_key=%s found %d matching incident(s).",
-            incident_key, len(incidents),
+
+        incidents = resp.json().get(
+            "incidents",
+            [],
         )
+
+        logger.info(
+            "PagerDuty lookup for incident_key=%s found %d matching incident(s).",
+            incident_key,
+            len(incidents),
+        )
+
         return incidents[0] if incidents else None
+
     except requests.exceptions.RequestException as exc:
-        logger.error("Failed to look up existing incident for key %s: %s", incident_key, exc)
+
+        logger.error(
+            "Failed to look up existing PagerDuty incident "
+            "for incident_key=%s: %s",
+            incident_key,
+            exc,
+        )
+
         return None
 
 
-def resolve_incident(routing_key: str, dedup_key: str) -> dict:
-    """Resolve an existing PagerDuty incident by dedup key."""
+# ---------------------------------------------------------------------------
+# Resolve PagerDuty incident
+# ---------------------------------------------------------------------------
+
+def resolve_incident(
+    routing_key: str,
+    dedup_key: str,
+) -> dict:
+    """
+    Resolve an existing PagerDuty incident using the Events API v2.
+
+    Args:
+        routing_key:
+            PagerDuty Events API v2 integration/routing key.
+
+        dedup_key:
+            Deduplication key of the incident to resolve.
+
+    Returns:
+        Dictionary containing success status and message.
+    """
+
     payload = {
         "routing_key": routing_key,
         "event_action": "resolve",
         "dedup_key": dedup_key,
     }
+
     try:
+
         resp = requests.post(
             PD_EVENTS_URL,
             json=payload,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+            },
             timeout=REQUEST_TIMEOUT,
         )
+
         resp.raise_for_status()
-        logger.info("PagerDuty incident resolved. dedup_key=%s", dedup_key)
-        return {"success": True, "message": "Incident resolved"}
+
+        logger.info(
+            "PagerDuty incident resolved successfully. dedup_key=%s",
+            dedup_key,
+        )
+
+        return {
+            "success": True,
+            "message": "Incident resolved",
+        }
+
     except requests.exceptions.RequestException as exc:
-        logger.error("Failed to resolve PagerDuty incident: %s", exc)
-        return {"success": False, "message": str(exc)}
+
+        logger.error(
+            "Failed to resolve PagerDuty incident: %s",
+            exc,
+        )
+
+        return {
+            "success": False,
+            "message": str(exc),
+        }
