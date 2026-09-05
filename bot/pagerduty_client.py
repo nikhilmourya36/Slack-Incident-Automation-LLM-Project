@@ -157,6 +157,11 @@ def trigger_incident(
             # here is still almost always the duplicate-key case, not a
             # genuine system failure -- flag it so callers can phrase this
             # differently from "paging is broken, do it manually".
+            logger.warning(
+                "Got 400 for incident_key=%s but lookup found nothing -- "
+                "treating as likely_duplicate anyway (couldn't confirm which incident).",
+                incident_key,
+            )
             return {
                 "success": False,
                 "incident_key": incident_key,
@@ -200,6 +205,10 @@ def _lookup_incident_by_key(api_key: str, incident_key: str, timeout: float) -> 
         )
         resp.raise_for_status()
         incidents = resp.json().get("incidents", [])
+        logger.info(
+            "Lookup for incident_key=%s found %d matching incident(s).",
+            incident_key, len(incidents),
+        )
         return incidents[0] if incidents else None
     except requests.exceptions.RequestException as exc:
         logger.error("Failed to look up existing incident for key %s: %s", incident_key, exc)
