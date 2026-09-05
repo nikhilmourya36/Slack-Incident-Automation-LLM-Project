@@ -124,6 +124,7 @@ def trigger_incident(
             "incident_key": incident_key,
             "incident_url": incident.get("html_url"),
             "incident_number": incident.get("incident_number"),
+            "likely_duplicate": False,
             "message": "Incident created",
         }
     except requests.exceptions.HTTPError as exc:
@@ -136,8 +137,7 @@ def trigger_incident(
         # merges automatically). The exact error wording -- and even whether
         # a body is returned at all -- isn't reliable enough to pattern-match
         # on, so on ANY 400 we just check directly: does an incident with
-        # this key already exist? If so, reuse it. If not, this was some
-        # other genuine validation error, and we report it as a failure below.
+        # this key already exist? If so, reuse it.
         if status_code == 400:
             existing = _lookup_incident_by_key(api_key, incident_key, timeout)
             if existing:
@@ -150,14 +150,28 @@ def trigger_incident(
                     "incident_key": incident_key,
                     "incident_url": existing.get("html_url"),
                     "incident_number": existing.get("incident_number"),
+                    "likely_duplicate": True,
                     "message": "Reused existing open incident (already reported today)",
                 }
+            # Couldn't confirm the existing incident via lookup, but a 400
+            # here is still almost always the duplicate-key case, not a
+            # genuine system failure -- flag it so callers can phrase this
+            # differently from "paging is broken, do it manually".
+            return {
+                "success": False,
+                "incident_key": incident_key,
+                "incident_url": None,
+                "incident_number": None,
+                "likely_duplicate": True,
+                "message": f"{exc} — {body_text or '(no additional details from PagerDuty)'}",
+            }
 
         return {
             "success": False,
             "incident_key": incident_key,
             "incident_url": None,
             "incident_number": None,
+            "likely_duplicate": False,
             "message": f"{exc} — {body_text}",
         }
     except requests.exceptions.RequestException as exc:
@@ -167,6 +181,7 @@ def trigger_incident(
             "incident_key": incident_key,
             "incident_url": None,
             "incident_number": None,
+            "likely_duplicate": False,
             "message": str(exc),
         }
 

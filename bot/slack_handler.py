@@ -164,11 +164,19 @@ def _page_on_call(channel_id: str, ts: str, url: str, status: str, original_mess
     )
 
     if not pd_result.get("success"):
-        _reply(
-            channel_id, ts,
-            f":warning: {oncall_mention} — tried to page automatically but it failed "
-            f"({pd_result.get('message', 'unknown error')}). Please page manually.",
-        )
+        if pd_result.get("likely_duplicate"):
+            _reply(
+                channel_id, ts,
+                f":information_source: {oncall_mention} — a similar issue already appears to "
+                f"be open in PagerDuty (couldn't confirm the exact incident automatically). "
+                f"Please check PagerDuty directly rather than paging again.",
+            )
+        else:
+            _reply(
+                channel_id, ts,
+                f":warning: {oncall_mention} — tried to page automatically but it failed "
+                f"({pd_result.get('message', 'unknown error')}). Please page manually.",
+            )
         return
 
     incident_url = pd_result.get("incident_url")
